@@ -1,16 +1,19 @@
+
+
+from signature_engine import signature_detect
+#from heuristic_engine import detect as heuristic_detect
+#from anomaly_engine import detect as anomaly_detect
+from behavioral_engine import behavioral_detect
+
 from logger import log_alert
 
-# Dummy example for now
-def run_ids(pkt, profile=None):
-    src_ip = pkt["src_ip"]
-    vendor = (profile or {}).get("vendor", "").lower()
-    device_type = (profile or {}).get("device_type", "unknown")
+def run_detections(pkt):
+    alerts = []
 
-    # SAMPLE TEST RULE: Detect Samsung device traffic
-    if "samsung" in vendor:
-        log_alert({
-            "rule": "samsung_tv_traffic",
-            "src_ip": src_ip,
-            "device_type": device_type,
-            "details": "Traffic detected from Samsung TV"
-        })
+    for engine in [signature_detect, behavioral_detect]:
+        result = engine(pkt)
+        if result:
+            alerts.extend(result)
+
+    return alerts
+
