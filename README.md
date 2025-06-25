@@ -20,3 +20,5 @@ Run the dashboard:
 
 Streamlit will open the dashboard in your browser at http://localhost:8501. 
 You may view the dashboard from other devices on the network with http://{host device IP}:8501
+
+start scanning with "python ./packet_scanner.py"
