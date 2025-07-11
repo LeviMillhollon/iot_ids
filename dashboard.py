@@ -1,108 +1,253 @@
-# dashboard.py
 
-import streamlit as st
-import pandas as pd
-import json
-import os
+
+# ──────────────────────────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────────────────────────
+from __future__ import annotations
+from pathlib import Path
+from collections import deque
 from datetime import datetime
+import json, os, pandas as pd, streamlit as st
 
+# ──────────────────────────────────────────────────────────────
+# Config (override via env vars if you want)
+# ──────────────────────────────────────────────────────────────
+HOME_FILE    = Path(os.getenv("IDS_HOME_FILE",  "devices_home.json"))
+AP_FILE      = Path(os.getenv("IDS_AP_FILE",    "devices_ap.json"))
+ALERT_FILE   = Path(os.getenv("IDS_ALERT_FILE", "alerts.jsonl"))
+SURICATA_DIR = Path("/var/log/suricata")
+EVE_FILE     = SURICATA_DIR / "eve.json"
 
-st.set_page_config(page_title="IoT IDS Dashboard", layout="wide")
-st.title("📡 IoT IDS Alert Dashboard")
+# ──────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────
+SEV_NUM = {1: "background-color:red",
+           2: "background-color:orange",
+           3: "background-color:lightgreen",
+           4: "background-color:lightgray"}
+SEV_STR = {"high":   SEV_NUM[1],
+           "medium": SEV_NUM[2],
+           "low":    SEV_NUM[3],
+           "info":   SEV_NUM[4]}
 
-st.subheader("Devices Found on Network")
+def _hilite(row):
+    sev = row.get("severity")
+    try:
+        sev = int(sev)
+        colour = SEV_NUM.get(sev, "")
+    except (ValueError, TypeError):
+        colour = SEV_STR.get(str(sev).lower(), "")
+    return [colour] * len(row)
 
-def load_devices(filepath="devices.json"):
-    if not os.path.exists(filepath):
-        st.warning("⚠️ devices.json not found. Run the fingerprint engine first.")
-        return None
-    with open(filepath, "r") as f:
-        try:
-            devices = json.load(f)
-            return pd.DataFrame(devices)
-        except json.JSONDecodeError:
-            st.error("❌ Error decoding devices.json")
-            return None
+@st.cache_data(ttl=5)
+def _load_json(path: Path) -> list[dict]:
+    if not path.exists() or path.stat().st_size == 0:
+        return []
+    try:
+        with open(path) as fh:
+            if path.suffix == ".jsonl":
+                return [json.loads(line) for line in fh if line.strip()]
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError):
+        return []
 
-device_df = load_devices()
-
-if device_df is not None and not device_df.empty:
-    st.dataframe(device_df, use_container_width=True)
-    st.sidebar.download_button("Download Devices as CSV", device_df.to_csv(index=False), "devices.csv", "text/csv")
-else:
-    st.info("No devices to display.")
-
-   
-
-def load_alerts(filepath="alerts.jsonl"):
-    if not os.path.exists(filepath):
-        st.warning("⚠️ alerts.jsonl file not found. Run the IDS to generate alerts.")
-        return None
-    alerts = []
-    with open(filepath, "r") as f:
-        for line in f:
-            try:
-                alerts.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    if not alerts:
-        st.info("No alerts found.")
-        return None
-    df = pd.DataFrame(alerts)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], format='ISO8601')
+@st.cache_data(ttl=5)
+def _tail_jsonl(path: Path, n: int) -> pd.DataFrame:
+    dq = deque(maxlen=n)
+    if path.exists():
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    dq.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    df = pd.DataFrame(dq)
+    if not df.empty and "timestamp" in df:
+        df["timestamp"] = pd.to_datetime(df["timestamp"],
+                                         utc=True, errors="coerce")
     return df
 
-df = load_alerts()
+def _truncate(path: Path) -> bool:
+    try:
+        path.write_text("")
+        return True
+    except Exception:
+        return False
 
+def _truncate_dir(d: Path) -> list[str]:
+    cleared: list[str] = []
+    if d.is_dir():
+        for f in d.iterdir():
+            if f.suffix in (".json", ".log") and _truncate(f):
+                cleared.append(f.name)
+    return cleared
 
+def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate column names caused by case-mismatch merges."""
+    return df.loc[:, ~df.columns.duplicated()] if not df.empty else df
 
-if df is not None:
-    st.sidebar.header("🔍 Filter Alerts")
-    ip_filter = st.sidebar.multiselect("Filter by Source IP", sorted(df["src_ip"].unique()))
-    rule_filter = st.sidebar.multiselect("Filter by Rule", sorted(df["rule"].unique()))
+# ──────────────────────────────────────────────────────────────
+# Streamlit main
+# ──────────────────────────────────────────────────────────────
+def main() -> None:
+    st.set_page_config(page_title="📡 IoT-IDS Dashboard", layout="wide")
+    st.title("📡 IoT-IDS Alert Dashboard")
 
-    if ip_filter:
-        df = df[df["src_ip"].isin(ip_filter)]
-    if rule_filter:
-        df = df[df["rule"].isin(rule_filter)]
+    # ───── Sidebar housekeeping ───────────────────────────────
+    st.sidebar.header("⚙️ Controls")
+    for label, fp in (("Home Devices", HOME_FILE),
+                      ("AP Devices",   AP_FILE),
+                      ("Alerts",       ALERT_FILE)):
+        if st.sidebar.button(f"Clear {label}"):
+            st.sidebar.success("Cleared." if _truncate(fp) else "Not found.")
+    if st.sidebar.button("Clear Suricata Logs"):
+        done = _truncate_dir(SURICATA_DIR)
+        st.sidebar.success("Truncated: " + ", ".join(done) if done else "None.")
+    if st.sidebar.button("Clear All"):
+        for p in (HOME_FILE, AP_FILE, ALERT_FILE):
+            _truncate(p)
+        _truncate_dir(SURICATA_DIR)
+        st.sidebar.success("Everything cleared.")
+    show_incidents = st.sidebar.checkbox("Show Flow Incidents", value=True)
+    if st.sidebar.button("🔄 Refresh Data"):
+        st.experimental_rerun()
 
-    st.subheader("📊 Summary Table")
-    summary = (
-        df.groupby(["src_ip", "rule"])
-        .agg(count=("rule", "count"), last_seen=("timestamp", "max"))
-        .reset_index()
-        .sort_values(by="last_seen", ascending=False)
-    )
-    st.dataframe(summary, use_container_width=True)
+    # ───── Load datasets (with de-dupe) ───────────────────────
+    df_home   = _dedupe(pd.DataFrame(_load_json(HOME_FILE)))
+    df_ap     = _dedupe(pd.DataFrame(_load_json(AP_FILE)))
+    df_alerts = _dedupe(pd.DataFrame(_load_json(ALERT_FILE)))
+    df_eve    = _tail_jsonl(EVE_FILE, 500)
 
+    # Normalise ‘dest_ip’→‘dst_ip’ so filters work
+    for df in (df_alerts, df_eve):
+        if "dest_ip" in df.columns:
+            df["dst_ip"] = df["dest_ip"]
+        elif "dst_ip" not in df.columns:
+            df["dst_ip"] = None
 
+    # ───── Home vs. AP tables (kept 100 % separate) ───────────
+    for title, df, fname in (
+        ("🏠 Home Network Devices", df_home, "home_devices.csv"),
+        ("🚩 AP-Connected Devices", df_ap, "ap_devices.csv"),
+    ):
+        st.subheader(title)
+        if df.empty:
+            st.info("None found.")
+        else:
+            st.dataframe(df, use_container_width=True)
+            st.sidebar.download_button(f"Download {title.split()[0]} CSV",
+                                       df.to_csv(index=False),
+                                       file_name=fname,
+                                       mime="text/csv")
 
+    # ───── Alerts summary & details ───────────────────────────
+    st.markdown("---")
+    st.subheader("🔔 Alerts Summary & Details")
+    if df_alerts.empty:
+        st.info("No alerts generated yet.")
+    else:
+        st.sidebar.subheader("🔍 Filter Alerts")
+        ip_sel   = st.sidebar.multiselect(
+            "Source IP",
+            sorted(df_alerts.get("src_ip", pd.Series(dtype=str))
+                              .dropna().unique()))
+        rule_sel = st.sidebar.multiselect(
+            "Rule",
+            sorted(df_alerts.get("rule", pd.Series(dtype=str))
+                              .dropna().unique()))
 
-    # Severity-to-color mapping
-    SEVERITY_COLOR = {
-        "high": "red",
-        "medium": "orange",
-        "low": "lightgreen",
-        "unknown": "gray"
-    }
+        data = df_alerts.copy()
+        if ip_sel:
+            data = data[data["src_ip"].isin(ip_sel)]
+        if rule_sel:
+            data = data[data["rule"].isin(rule_sel)]
 
-    def color_row(row):
-        severity = str(row.get("severity", "unknown")).lower()
-        color = SEVERITY_COLOR.get(severity, "gray")
-        return [f"background-color: {color}"] * len(row)
+        for c in ("app_proto", "dest_country"):
+            if c not in data.columns:
+                data[c] = None
 
-    if st.checkbox("Show Raw Alerts"):
-        st.subheader("📄 Raw Alerts")
-        styled_df = df.sort_values(by="timestamp", ascending=False).style.apply(color_row, axis=1)
-        st.dataframe(styled_df, use_container_width=True)
+        g_cols = [c for c in
+                  ("src_ip", "dst_ip", "rule", "severity",
+                   "app_proto", "dest_country") if c in data]
+        summary = (data.groupby(g_cols, dropna=False)
+                         .agg(count      =("rule", "count"),
+                              first_seen =("timestamp", "min"),
+                              last_seen  =("timestamp", "max"))
+                         .reset_index()
+                         .sort_values("last_seen", ascending=False))
 
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("📁 Export Data")
+        st.dataframe(summary.style.apply(_hilite, axis=1),
+                     use_container_width=True)
+        st.sidebar.download_button("Download Alert Summary CSV",
+                                   summary.to_csv(index=False),
+                                   "alert_summary.csv", "text/csv")
 
-    csv = summary.to_csv(index=False).encode("utf-8")
-    st.sidebar.download_button("Download Summary as CSV", csv, "alert_summary.csv", "text/csv")
+        if st.checkbox("Show Raw Alerts"):
+            st.dataframe(data.sort_values("timestamp", ascending=False)
+                             .style.apply(_hilite, axis=1),
+                         use_container_width=True)
+            st.sidebar.download_button("Raw Alerts JSON",
+                                       data.to_json(orient="records",
+                                                    date_format="iso"),
+                                       "raw_alerts.json",
+                                       "application/json")
 
-    json_export = df.to_json(orient="records", date_format="iso")
-    st.sidebar.download_button("Download Raw Alerts as JSON", json_export, "raw_alerts.json", "application/json")
+        # ─── Flow incidents (optional) ────────────────────────
+        if show_incidents:
+            st.markdown("---")
+            st.subheader("🗂️ Flow Incidents")
+            if data.empty:
+                st.info("No flow incidents.")
+            else:
+                ports = [c for c in ("src_port", "dst_port") if c in data]
+                group_cols = ["src_ip", "dst_ip"] + ports
+                inc_group = (data.groupby(group_cols, dropna=False)
+                                   .agg(count     =("rule", "count"),
+                                        first_seen=("timestamp", "min"),
+                                        last_seen =("timestamp", "max"),
+                                        rules      =("rule",
+                                                     lambda s: ", "
+                                                     .join(sorted(set(s)))))
+                                   .reset_index()
+                                   .sort_values("last_seen",
+                                                ascending=False))
+                st.dataframe(inc_group.style.apply(_hilite, axis=1),
+                             use_container_width=True)
 
+    # ───── Suricata alert log tail ────────────────────────────
+    st.markdown("---")
+    st.subheader("📊 Suricata Recent Alerts (500-line tail)")
+    if "alert" not in df_eve.columns or \
+       df_eve[df_eve["event_type"] == "alert"].empty:
+        st.info("No recent Suricata alerts.")
+    else:
+        eve_alerts = df_eve[df_eve["event_type"] == "alert"].copy()
+        eve_alerts["signature"] = eve_alerts["alert"].apply(
+            lambda a: a.get("signature") if isinstance(a, dict) else None)
 
+        def _join(a, key):
+            if isinstance(a, dict) and isinstance(a.get("metadata"), dict):
+                return ", ".join(a["metadata"].get(key, []))
+            return None
+
+        eve_alerts["cve"]   = eve_alerts["alert"].apply(lambda a: _join(a, "cve"))
+        eve_alerts["mitre"] = eve_alerts["alert"].apply(lambda a: _join(a, "mitre"))
+        if "dest_geoip" in eve_alerts.columns:
+            eve_alerts["dest_country"] = eve_alerts["dest_geoip"].apply(
+                lambda g: g.get("country_iso") if isinstance(g, dict) else None)
+
+        show_cols = [c for c in
+                     ("timestamp", "signature", "src_ip", "dst_ip",
+                      "cve", "mitre", "severity", "dest_country")
+                     if c in eve_alerts.columns]
+
+        st.dataframe(eve_alerts[show_cols]
+                     .rename(columns={"dest_country": "dst_cc"})
+                     .style.apply(_hilite, axis=1),
+                     use_container_width=True)
+
+# ──────────────────────────────────────────────────────────────
+# Entry-point
+# ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    main()

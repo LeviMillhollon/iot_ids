@@ -1,160 +1,245 @@
+"""behavioral_engine.py
 
-# behavioral_engine.py
+Heuristic detection for:
+ - Port scans
+ - Brute-force login attempts
+ - DDoS floods
+ - C&C beaconing
+ - Data exfiltration
+
+All alerts use Suricata‐style numeric severity (1–4) plus CSS color mapping.
+"""
+
+from __future__ import annotations
 
 import time
+import threading
 import statistics
+import re
 from collections import defaultdict, deque
 from datetime import datetime
-from scapy.all import IP, TCP, UDP
+from typing import List, Dict, Tuple
+
+from scapy.all import IP, TCP, UDP, Raw  # type: ignore
+from scapy.layers.dns import DNSQR       # type: ignore
+
 from logger import log_alert
 
-# Configurable thresholds
-PORT_SCAN_THRESHOLD = 10       # number of unique ports per IP
-PORT_SCAN_WINDOW    = 60       # seconds
+# ──────────────────────────────────────────────────────────────────────────────
+# Config thresholds
+# ──────────────────────────────────────────────────────────────────────────────
+PORT_SCAN_THRESHOLD     = 10    # unique dest ports
+PORT_SCAN_WINDOW        = 60    # seconds
 
-BRUTE_FORCE_THRESHOLD = 5      # failed login attempts
-BRUTE_FORCE_WINDOW    = 60     # seconds
+BRUTE_FORCE_THRESHOLD   = 5     # failures
+BRUTE_FORCE_WINDOW      = 60    # seconds
+BRUTE_PORTS             = {22, 23, 80, 443}
 
-DDOS_RATE_THRESHOLD = 600       # packets
-DDOS_TIME_WINDOW    = 1       # seconds
+DDOS_RATE_THRESHOLD     = 600   # packets
+DDOS_TIME_WINDOW        = 1     # second
 
-CNC_CONTACTS_THRESHOLD = 10    # total contacts
-CNC_TOTAL_THRESHOLD   = 10       # total contacts across hosts
-CNC_MIN_PER_HOST      = 5        # min contacts per host
-CNC_HOSTS_MAX         = 3        # max distinct hosts
-CNC_TIME_WINDOW       = 60       # seconds
-CNC_PERIODIC_CV_MAX   = 0.5      # max coeff of variation for periodicity
+CNC_TOTAL_THRESHOLD     = 10    # total hits
+CNC_MIN_PER_HOST        = 5     # per distinct host
+CNC_HOSTS_MAX           = 3     # distinct dst hosts
+CNC_TIME_WINDOW         = 60    # seconds
+CNC_PERIODIC_CV_MAX     = 0.5   # coefficient of variation
 
+EXFIL_VOLUME_THRESHOLD  = 1_000_000  # bytes
+EXFIL_WINDOW_SECONDS    = 60
 
-# In-memory trackers
-scan_tracker   = defaultdict(lambda: deque())
-brute_tracker  = defaultdict(lambda: deque())
-ddos_tracker   = defaultdict(lambda: deque())
-cnc_tracker    = defaultdict(lambda: defaultdict(lambda: deque()))
+# Dedup cooldowns
+COOLDOWN_SEC = 120  # fallback for behavioral detections
 
-def is_periodic(timestamps):
-    """Return True if timestamps intervals have low variance (C&C beaconing)."""
-    if len(timestamps) < 3:
+# ──────────────────────────────────────────────────────────────────────────────
+# Severity & colour mapping
+# ──────────────────────────────────────────────────────────────────────────────
+SEV_LABEL_TO_NUM = {
+    "high":     1,
+    "medium":   2,
+    "low":      3,
+    "info":     4,
+    "critical": 1,  # map critical to high
+    "unknown":  4,
+}
+SEV_LABEL_TO_COLOR = {
+    "high":     "background-color:red",
+    "medium":   "background-color:orange",
+    "low":      "background-color:lightgreen",
+    "info":     "background-color:lightgray",
+    "critical": "background-color:darkred",
+    "unknown":  "background-color:lightgray",
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Thread-safe state for each detection category
+# ──────────────────────────────────────────────────────────────────────────────
+_lock = threading.Lock()
+_scan_tracker   = defaultdict(lambda: deque())                  # src_ip -> deque[(port,ts)]
+_brute_tracker  = defaultdict(lambda: deque())                  # src_ip -> deque[(ts,is_failure)]
+_ddos_tracker   = defaultdict(lambda: deque())                  # (src,dst) -> deque[ts]
+_cnc_tracker    = defaultdict(lambda: defaultdict(lambda: deque()))  # src -> dst -> deque[ts]
+_exfil_tracker  = defaultdict(lambda: deque())                  # src -> deque[(bytes,ts)]
+_cooldowns      = defaultdict(lambda: defaultdict(lambda: 0))   # src -> rule -> last_ts
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def _now() -> float:
+    return time.monotonic()
+
+def _utc_ts() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+def _prune(q: deque, window: float, now: float):
+    while q:
+        ts = q[0][1] if isinstance(q[0], tuple) else q[0]
+        if now - ts > window:
+            q.popleft()
+        else:
+            break
+
+def is_periodic(times: deque) -> bool:
+    if len(times) < 3:
         return False
-    intervals = [t2 - t1 for t1, t2 in zip(timestamps, list(timestamps)[1:])]
+    intervals = [t2 - t1 for t1, t2 in zip(times, list(times)[1:])]
     mean_i = statistics.mean(intervals)
     cv = statistics.pstdev(intervals) / mean_i if mean_i else 1
     return cv <= CNC_PERIODIC_CV_MAX
 
+def _get_cooldown(rule: str) -> float:
+    return _cooldowns[rule].get('cooldown', COOLDOWN_SEC)
 
-def behavioral_detect(packet):
-    """Detect behavioral anomalies: port scan, brute-force, DDoS, C&C beaconing."""
-    alerts = []
-    now = time.time()
+def _set_cooldown(rule: str, now: float):
+    _cooldowns[rule]['ts'] = now
+
+def _ready(rule: str, now: float) -> bool:
+    last = _cooldowns[rule].get('ts', 0)
+    return (now - last) >= COOLDOWN_SEC
+
+def _build_alert(
+    src: str, dst: str, rule: str, desc: str, severity_label: str
+) -> Dict:
+    num = SEV_LABEL_TO_NUM.get(severity_label, SEV_LABEL_TO_NUM['unknown'])
+    color = SEV_LABEL_TO_COLOR.get(severity_label, SEV_LABEL_TO_COLOR['unknown'])
+    alert = {
+        "type":           "Behavioral Detection",
+        "rule":           rule,
+        "description":    desc,
+        "src_ip":         src,
+        "dst_ip":         dst,
+        "timestamp":      _utc_ts(),
+        "severity":       num,
+        "severity_label": severity_label,
+        "color":          color,
+        "source":         "Heuristics",
+    }
+    return alert
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main API
+# ──────────────────────────────────────────────────────────────────────────────
+def behavioral_detect(packet) -> List[Dict]:
+    alerts: List[Dict] = []
+    now = _now()
 
     if not packet.haslayer(IP):
         return alerts
 
-    src_ip = packet[IP].src
-    dst_ip = packet[IP].dst
+    src = packet[IP].src
+    dst = packet[IP].dst
+    pkt_len = len(packet)
 
-    # --- Port scan detection ---
-    if packet.haslayer(TCP):
-        dst_port = packet[TCP].dport
-        scan_tracker[src_ip].append((dst_port, now))
-        # prune old
-        while scan_tracker[src_ip] and now - scan_tracker[src_ip][0][1] > PORT_SCAN_WINDOW:
-            scan_tracker[src_ip].popleft()
-        unique_ports = {p for p, t in scan_tracker[src_ip]}
-        if len(unique_ports) >= PORT_SCAN_THRESHOLD:
-            alerts.append({
-                "type": "Behavioral Detection",
-                "rule": "Port Scanning",
-                "description": f"Detected port scanning from {src_ip} to {len(unique_ports)} ports.",
-                "src_ip": src_ip,
-                "dst_ip": dst_ip,
-                "timestamp": datetime.now().isoformat(),
-                "severity": "medium",
-                "source": "Heuristics",
-                "color": "orange"
-            })
-            scan_tracker[src_ip].clear()
+    with _lock:
+        # 1) Port scanning
+        if packet.haslayer(TCP):
+            port = packet[TCP].dport
+            q = _scan_tracker[src]
+            q.append((port, now))
+            _prune(q, PORT_SCAN_WINDOW, now)
+            unique_ports = {p for p, _ in q}
+            if len(unique_ports) >= PORT_SCAN_THRESHOLD and _ready('port_scan', now):
+                alerts.append(
+                    _build_alert(src, dst, "Port Scanning",
+                                 f"{len(unique_ports)} distinct ports in {PORT_SCAN_WINDOW}s",
+                                 "medium")
+                )
+                _set_cooldown('port_scan', now)
+                q.clear()
 
-    # --- Brute-force login detection ---
-    if packet.haslayer(TCP) and hasattr(packet, 'load'):
-        try:
-            payload = packet.load.decode(errors="ignore").lower()
-            if any(k in payload for k in ("login", "username", "password")):
-                brute_tracker[src_ip].append(now)
-                while brute_tracker[src_ip] and now - brute_tracker[src_ip][0] > BRUTE_FORCE_WINDOW:
-                    brute_tracker[src_ip].popleft()
-                if len(brute_tracker[src_ip]) >= BRUTE_FORCE_THRESHOLD:
-                    alerts.append({
-                        "type": "Behavioral Detection",
-                        "rule": "Brute Force Login Attempt",
-                        "description": f"Brute-force login detected from {src_ip}.",
-                        "src_ip": src_ip,
-                        "dst_ip": dst_ip,
-                        "timestamp": datetime.now().isoformat(),
-                        "severity": "high",
-                        "source": "Heuristics",
-                        "color": "red"
-                    })
-                    brute_tracker[src_ip].clear()
-        except Exception:
-            pass
+        # 2) Brute-force login
+        if packet.haslayer(Raw) and packet.haslayer(TCP) and packet[TCP].dport in BRUTE_PORTS:
+            try:
+                payload = packet[Raw].load.decode('utf-8', 'ignore')
+            except:
+                payload = ""
+            is_fail = bool(re.search(r"(invalid password|login failed|authentication error)", payload, re.I))
+            is_prompt = bool(re.search(r"\b(username|login):\s*\w+", payload, re.I))
+            if is_fail or is_prompt:
+                bq = _brute_tracker[src]
+                bq.append((now, is_fail))
+                _prune(bq, BRUTE_FORCE_WINDOW, now)
+                fails = sum(1 for t, fail in bq if fail)
+                if fails >= BRUTE_FORCE_THRESHOLD and _ready('brute_force', now):
+                    alerts.append(
+                        _build_alert(src, dst, "Brute Force Login",
+                                     f"{fails} failed attempts in {BRUTE_FORCE_WINDOW}s", "high")
+                    )
+                    _set_cooldown('brute_force', now)
+                    bq.clear()
 
-    # --- DDoS flood detection ---
-    key = (src_ip, dst_ip)
-    ddos_tracker[key].append(now)
-    while ddos_tracker[key] and now - ddos_tracker[key][0] > DDOS_TIME_WINDOW:
-        ddos_tracker[key].popleft()
-    if len(ddos_tracker[key]) > DDOS_RATE_THRESHOLD:
-        alerts.append({
-            "type": "Behavioral Detection",
-            "rule": "DDoS Flood",
-            "description": f"High packet rate from {src_ip} to {dst_ip}: {len(ddos_tracker[key])} pkts/{DDOS_TIME_WINDOW}s.",
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "timestamp": datetime.now().isoformat(),
-            "severity": "critical",
-            "source": "Heuristics",
-            "color": "red"
-        })
-        ddos_tracker[key].clear()
+        # 3) DDoS flood
+        ddq = _ddos_tracker[(src, dst)]
+        ddq.append(now)
+        _prune(ddq, DDOS_TIME_WINDOW, now)
+        if len(ddq) > DDOS_RATE_THRESHOLD and _ready('ddos', now):
+            alerts.append(
+                _build_alert(src, dst, "DDoS Flood",
+                             f"{len(ddq)} pkts/sec to {dst}", "critical")
+            )
+            _set_cooldown('ddos', now)
+            ddq.clear()
 
-    # --- C&C beaconing detection ---
-     # Track contact times per host
-    cnc_tracker[src_ip][dst_ip].append(now)
-    # prune and cleanup
-    for host in list(cnc_tracker[src_ip]):
-        times = deque(t for t in cnc_tracker[src_ip][host] if now - t <= CNC_TIME_WINDOW)
-        if times:
-            cnc_tracker[src_ip][host] = times
-        else:
-            del cnc_tracker[src_ip][host]
+        # 4) C&C beaconing
+        cncd = _cnc_tracker[src][dst]
+        cncd.append(now)
+        # prune all peers and check conditions
+        for peer, times in list(_cnc_tracker[src].items()):
+            _prune(times, CNC_TIME_WINDOW, now)
+            if not times:
+                del _cnc_tracker[src][peer]
+        hosts = list(_cnc_tracker[src].keys())
+        total = sum(len(t) for t in _cnc_tracker[src].values())
+        counts = [len(t) for t in _cnc_tracker[src].values()]
+        if (
+            0 < len(hosts) <= CNC_HOSTS_MAX
+            and total >= CNC_TOTAL_THRESHOLD
+            and all(c >= CNC_MIN_PER_HOST for c in counts)
+            and any(is_periodic(t) for t in _cnc_tracker[src].values())
+            and _ready('cnc', now)
+        ):
+            periodic = [h for h, t in _cnc_tracker[src].items() if is_periodic(t)]
+            alerts.append(
+                _build_alert(src, dst, "C&C Beaconing",
+                             f"Beaconing to {hosts}, periodic on {periodic}", "medium")
+            )
+            _set_cooldown('cnc', now)
+            _cnc_tracker[src].clear()
 
-    unique_hosts   = list(cnc_tracker[src_ip].keys())
-    total_contacts = sum(len(q) for q in cnc_tracker[src_ip].values())
-    per_host_counts = [len(q) for q in cnc_tracker[src_ip].values()]
+        # 5) Data exfiltration
+        eq = _exfil_tracker[src]
+        eq.append((pkt_len, now))
+        _prune(eq, EXFIL_WINDOW_SECONDS, now)
+        volume = sum(size for size, _ in eq)
+        if volume > EXFIL_VOLUME_THRESHOLD and _ready('exfil', now):
+            alerts.append(
+                _build_alert(src, dst, "Data Exfiltration",
+                             f"{volume} bytes sent in {EXFIL_WINDOW_SECONDS}s", "high")
+            )
+            _set_cooldown('exfil', now)
+            eq.clear()
 
-    # Decide beaconing: few hosts, enough volume, per-host threshold, and periodicity
-    if (
-        len(unique_hosts) <= CNC_HOSTS_MAX and
-        total_contacts >= CNC_TOTAL_THRESHOLD and
-        all(count >= CNC_MIN_PER_HOST for count in per_host_counts) and
-        any(is_periodic(q) for q in cnc_tracker[src_ip].values())
-    ):
-        alerts.append({
-            "type": "Behavioral Detection",
-            "rule": "Possible C&C Beaconing",
-            "description": (
-                f"C&C beaconing from {src_ip} to hosts {unique_hosts}; "
-                f"periodic: {[h for h, q in cnc_tracker[src_ip].items() if is_periodic(q)]}"
-            ),
-            "src_ip": src_ip,
-            "dst_ip": dst_ip,
-            "timestamp": datetime.now().isoformat(),
-            "severity": "medium",
-            "source": "Heuristics",
-            "color": "orange"
-        })
-        cnc_tracker[src_ip].clear()
+    # emit
+    for al in alerts:
+        log_alert(al)
 
     return alerts
-
