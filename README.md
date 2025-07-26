@@ -89,7 +89,7 @@ iot_ids/
 ├── discovery.py             # Device profiling
 ├── nmap_runner.py           # Active scan logic
 ├── logger.py                # JSONL logger
-├── auto_set.sh              # Setup script
+├── Device_setup.sh          # Setup script
 └── alerts.jsonl             # Example alert output
 ```
 
