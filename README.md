@@ -110,9 +110,4 @@ iot_ids/
 - If services fail, run:  
   `journalctl -u iotids.service --no-pager`
 
-"python -m streamlit run dashboard.py --server.port 8501 --browser.serverAddress localhost"
 
-Streamlit will open the dashboard in your browser at http://localhost:8501. 
-You may view the dashboard from other devices on the network with http://{host device IP}:8501
-
-start scanning with "python ./packet_scanner.py"
