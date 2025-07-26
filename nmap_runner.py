@@ -18,22 +18,50 @@ from classifier import Classifier
 
 # ───────────────────────── Script bundles ─────────────────────────
 BASE_SCRIPTS: List[str] = [
-    "vulners",            # map versions → CVEs
-    "vuln",             # generic vulnerability summary (uncomment if desired)
-    "banner",             # basic banner grab
+    #"vulners",                   # map versions → CVEs
+    "vuln",                     # generic vulnerability summary (uncomment if desired)
+    "banner",                    # basic banner grab
     "http-enum",
-    "http-title",
+    "http-title",                # grab HTML title for any web interface
     "http-server-header",
+    "http-robots.txt",           # Check for web server robots file (common in IoT)
+    "http-favicon",              # Fingerprint via favicon (useful for IoT web UIs)
+    "ssl-cert",                  # grab cert metadata from HTTPS
+    "http-default-accounts",     # check for known default HTTP creds
+    "http-auth-finder",          # probe different auth schemes
+    "ftp-anon",                  # anonymous FTP upload/download
     "broadcast-dns-service-discovery",
     "dns-service-discovery",
-    
+    "upnp-info",                 # UPnP for plug-and-play devices
+    #"ip-geolocation-geoplugin",
+    "mqtt-subscribe"             # subscribe to public MQTT topics
 ]
 DEVICE_SCRIPT_BUNDLES: Dict[str, List[str]] = {
-    "camera":  ["rtsp-methods", "rtsp-url-brute", "broadcast-upnp-info", "upnp-info"],
-    "tv":      ["broadcast-upnp-info", "upnp-info", "wsdd-discover"],
-    "speaker": ["broadcast-upnp-info", "upnp-info", "wsdd-discover"],
-    "printer": ["snmp-info", "http-printer-info"],
-    "router":  ["ssh-hostkey", "snmp-info"],
+    "camera": [
+        "rtsp-methods",          # RTSP for camera streaming
+        "rtsp-url-brute",        # Brute-force RTSP paths
+        "http-methods",          # Web interface verb enumeration
+        "broadcast-upnp-info",   # UPnP discovery
+        "broadcast-wsdd-discover", # WSD discovery
+        "ssl-heartbleed",        # HTTPS vulnerability check
+    ],
+    "tv": [
+        "broadcast-upnp-info",   # UPnP for media devices
+        "broadcast-wsdd-discover", # WSD discovery
+        "http-methods",          # Web interface verb enumeration
+    ],
+    "sound": [
+        "broadcast-upnp-info",   # UPnP for media devices
+        "broadcast-wsdd-discover", # WSD discovery
+        "http-methods",          # Web interface verb enumeration
+    ],
+    "computer": [
+        "smb-os-discovery",      # SMB for OS fingerprinting
+        "smb-enum-shares",       # SMB share enumeration
+        "rdp-ntlm-info",         # RDP NTLM info
+        "ssh-hostkey",           # SSH fingerprinting
+        "nbstat",                # NetBIOS info
+    ],
 }
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
 
@@ -41,6 +69,7 @@ def _script_set_for(dev_type: str) -> List[str]:
     return BASE_SCRIPTS + DEVICE_SCRIPT_BUNDLES.get(dev_type.lower(), [])
 
 # ───────────────────────── Nmap runner ───────────────────────────
+
 def run_nmap(ip: str, scripts: List[str], open_ports: List[int]) -> Optional[str]:
     """
     Deep scan only the discovered TCP ports, running version/OS detection
@@ -56,7 +85,6 @@ def run_nmap(ip: str, scripts: List[str], open_ports: List[int]) -> Optional[str
     cmd = [
         "nmap",
         "-sS",               # TCP SYN scan
-        "-sU",
         "-p", port_arg,      # only the discovered ports
         "-sV",               # service/version detection
         "-O",                # OS detection
@@ -188,7 +216,7 @@ def profile_device(ip: str, mac: str, dev_type: str) -> Dict:
             "vulns": [],
             "model": "Unknown",
             "firmware": "Unknown",
-            "os": "Unknown",
+            #"os": "Unknown",
             "score": result.confidence,
             "label": result.label,
         }
@@ -207,7 +235,7 @@ def profile_device(ip: str, mac: str, dev_type: str) -> Dict:
         "services":     services,
         "model":        model or "Unknown",
         "firmware":     firmware or "Unknown",
-        "os":           os_name or "Unknown",
+        #"os":           os_name or "Unknown",
         "vulns":        vulns,
         "score":        result.confidence,
         "label":        result.label,

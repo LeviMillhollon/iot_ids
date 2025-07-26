@@ -28,9 +28,16 @@ from discovery import (
     get_mac_vendor,
     reverse_dns,
     scan_ports,
+    get_dhcp_hostname,
 )
 from logger import log_alert
 from nmap_runner import profile_device
+from pathlib import Path
+
+
+
+
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -42,6 +49,7 @@ SURICATA_EVE  = "/var/log/suricata/eve.json"
 BASIC_FILE    = "devices_home.json"   # quick-scan results
 AP_FILE       = "devices_ap.json"     # deep-scan results
 LEASES_FILE   = "/var/lib/misc/dnsmasq.leases"
+PENDING_FILE = Path("pending_devices.json")
 POLL_INTERVAL = 10                     # seconds between AP polls
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -120,35 +128,53 @@ def _lookup_ap_ip(mac: str) -> str | None:
 
 def deep_scan_watcher() -> None:
     """
-    Continuously watch wlan1 for new stations,
-    deep-scan each with its quick-scan classified type,
-    and write pure deep-scan profiles to devices_ap.json.
+    Continuously watch for new stations on the AP, classify their type using
+    vendor and available data, deep-scan each, and write profiles to devices_ap.json.
     """
-    print(f"[+] Watching AP ({AP_IFACE}) for deep-scan clients…")
+    print("[+] Starting deep scan watcher…")
     while True:
-        for mac in _get_connected_macs():
-            with lock:
-                if mac in ap_profiles:          # already processed
-                    continue
-
+        connected_macs = _get_connected_macs()
+        with lock:
+            scanned_macs = set(ap_profiles.keys())
+        
+        # Identify pending devices
+        pending_devices = []
+        for mac in connected_macs - scanned_macs:
             ip = _lookup_ap_ip(mac)
-            if not ip:
-                continue                        # wait for DHCP lease
-
-            # Pull the quick-scan classification if available
-            base     = home_profiles.get(mac, {})
-            dev_type = base.get("device_type", "unknown")
-
+            if ip:
+                vendor = get_mac_vendor(mac)
+                # Get DNS name if available
+                dns = get_dhcp_hostname(mac) or reverse_dns(ip) or "Unknown"
+                # Classify device type using vendor and DNS name
+                classification = Classifier.classify_device(vendor, dns)
+                dev_type = classification.device_type.value.lower()
+                pending_devices.append({"mac": mac, "ip": ip, "vendor": vendor, "device_type": dev_type})
+        
+        # Write pending list to file
+        with open(PENDING_FILE, "w") as f:
+            json.dump(pending_devices, f, indent=2)
+        print(f"[+] Updated pending devices: {len(pending_devices)} in {PENDING_FILE}")
+        
+        # Process each pending device
+        for dev in pending_devices[:]:  # Use a copy to modify list during iteration
+            mac = dev["mac"]
+            ip = dev["ip"]
+            dev_type = dev["device_type"]
             print(f"[+] Deep-scanning {mac} @ {ip} as {dev_type}")
             profile = profile_device(ip, mac, dev_type)
-
             with lock:
                 ap_profiles[mac] = profile
-
-            with open(AP_FILE, "w") as fh:
-                json.dump(list(ap_profiles.values()), fh, indent=2)
-
+            
+            # Update devices_ap.json
+            with open(AP_FILE, "w") as f:
+                json.dump(list(ap_profiles.values()), f, indent=2)
             print(f"✅ Saved deep profile for {mac} → {AP_FILE}")
+            
+            # Update pending list by removing the scanned device
+            pending_devices = [d for d in pending_devices if d["mac"] != mac]
+            with open(PENDING_FILE, "w") as f:
+                json.dump(pending_devices, f, indent=2)
+        
         time.sleep(POLL_INTERVAL)
 
 # ──────────────────────────────────────────────────────────────────────────────

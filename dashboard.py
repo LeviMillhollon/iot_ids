@@ -1,8 +1,4 @@
-
-
-# ──────────────────────────────────────────────────────────────────
-# Config
-# ──────────────────────────────────────────────────────────────────
+#!/usr/bin/env python3
 from __future__ import annotations
 from pathlib import Path
 from collections import deque
@@ -10,13 +6,15 @@ from datetime import datetime
 import json, os, pandas as pd, streamlit as st
 
 # ──────────────────────────────────────────────────────────────
-# Config (override via env vars if you want)
+# Config
 # ──────────────────────────────────────────────────────────────
 HOME_FILE    = Path(os.getenv("IDS_HOME_FILE",  "devices_home.json"))
 AP_FILE      = Path(os.getenv("IDS_AP_FILE",    "devices_ap.json"))
 ALERT_FILE   = Path(os.getenv("IDS_ALERT_FILE", "alerts.jsonl"))
+PENDING_FILE = Path("pending_devices.json")
 SURICATA_DIR = Path("/var/log/suricata")
 EVE_FILE     = SURICATA_DIR / "eve.json"
+NMAP_DIR     = Path("/home/admin/IDS/nmap_results")  # Directory for Nmap scan results
 
 # ──────────────────────────────────────────────────────────────
 # Helpers
@@ -38,6 +36,25 @@ def _hilite(row):
     except (ValueError, TypeError):
         colour = SEV_STR.get(str(sev).lower(), "")
     return [colour] * len(row)
+
+
+
+
+@st.cache_data(ttl=5)
+def _load_pending_devices():
+    if PENDING_FILE.exists():
+        try:
+            with open(PENDING_FILE) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                else:
+                    return []
+        except json.JSONDecodeError:
+            return []
+    return []
+
+
 
 @st.cache_data(ttl=5)
 def _load_json(path: Path) -> list[dict]:
@@ -86,6 +103,29 @@ def _dedupe(df: pd.DataFrame) -> pd.DataFrame:
     """Drop duplicate column names caused by case-mismatch merges."""
     return df.loc[:, ~df.columns.duplicated()] if not df.empty else df
 
+@st.cache_data(ttl=5)
+def _load_nmap_report(ip: str) -> dict:
+    """Load the latest Nmap report for the given IP from nmap_results."""
+    if not NMAP_DIR.exists():
+        return {}
+    latest_file = None
+    latest_time = None
+    for file in NMAP_DIR.glob(f"nmap_scan_{ip}_*.json"):
+        try:
+            timestamp = datetime.strptime(file.stem.split("_")[-1], "%Y%m%d_%H%M%S")
+            if latest_time is None or timestamp > latest_time:
+                latest_time = timestamp
+                latest_file = file
+        except ValueError:
+            continue
+    if latest_file:
+        try:
+            with open(latest_file, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
 # ──────────────────────────────────────────────────────────────
 # Streamlit main
 # ──────────────────────────────────────────────────────────────
@@ -103,10 +143,14 @@ def main() -> None:
     if st.sidebar.button("Clear Suricata Logs"):
         done = _truncate_dir(SURICATA_DIR)
         st.sidebar.success("Truncated: " + ", ".join(done) if done else "None.")
+    if st.sidebar.button("Clear Nmap Results"):
+        done = _truncate_dir(NMAP_DIR)
+        st.sidebar.success("Truncated: " + ", ".join(done) if done else "None.")
     if st.sidebar.button("Clear All"):
-        for p in (HOME_FILE, AP_FILE, ALERT_FILE):
+        for p in (HOME_FILE, AP_FILE, ALERT_FILE, NMAP_DIR):
             _truncate(p)
         _truncate_dir(SURICATA_DIR)
+        _truncate_dir(NMAP_DIR)
         st.sidebar.success("Everything cleared.")
     show_incidents = st.sidebar.checkbox("Show Flow Incidents", value=True)
     if st.sidebar.button("🔄 Refresh Data"):
@@ -125,7 +169,13 @@ def main() -> None:
         elif "dst_ip" not in df.columns:
             df["dst_ip"] = None
 
-    # ───── Home vs. AP tables (kept 100 % separate) ───────────
+    # ───── Device selection for Nmap report ───────────────────
+    st.sidebar.subheader("📄 View Nmap Report")
+    all_devices = pd.concat([df_ap], ignore_index=True)
+    device_ips = sorted(all_devices.get("ip", pd.Series(dtype=str)).dropna().unique())
+    selected_ip = st.sidebar.selectbox("Select Device IP", ["Select a device"] + device_ips)
+    
+    # ───── Home vs. AP tables ────────────────────────────────
     for title, df, fname in (
         ("🏠 Home Network Devices", df_home, "home_devices.csv"),
         ("🚩 AP-Connected Devices", df_ap, "ap_devices.csv"),
@@ -139,6 +189,26 @@ def main() -> None:
                                        df.to_csv(index=False),
                                        file_name=fname,
                                        mime="text/csv")
+    
+            
+    # ───── Pending Devices table ─────────────────────────────
+    st.markdown("---")
+    st.subheader("⏳ Pending Devices (Awaiting Deep Scan)")
+    pending_devices = _load_pending_devices()
+    if not pending_devices:
+        st.info("No devices pending deep scan.")
+    else:
+        df_pending = pd.DataFrame(pending_devices)
+        st.dataframe(df_pending[["mac", "ip", "vendor", "device_type"]], use_container_width=True)
+        st.sidebar.download_button(
+            "Download Pending Devices CSV",
+            df_pending.to_csv(index=False),
+            "pending_devices.csv",
+            mime="text/csv"
+        )        
+            
+
+   
 
     # ───── Alerts summary & details ───────────────────────────
     st.markdown("---")
@@ -245,6 +315,40 @@ def main() -> None:
                      .rename(columns={"dest_country": "dst_cc"})
                      .style.apply(_hilite, axis=1),
                      use_container_width=True)
+        
+        
+     # ───── Nmap report display ───────────────────────────────
+    st.markdown("---")
+    st.subheader("📄 Nmap Scan Report")
+    if selected_ip == "Select a device" or not selected_ip:
+        st.info("Please select a device IP to view its Nmap report.")
+    else:
+        nmap_report = _load_nmap_report(selected_ip)
+        if not nmap_report:
+            st.warning(f"No Nmap report found for {selected_ip}.")
+        else:
+            with st.expander(f"Nmap Report for {selected_ip} ({nmap_report.get('device_type', 'Unknown')})", expanded=True):
+                st.write(f"**MAC**: {nmap_report.get('mac', 'Unknown')}")
+                st.write(f"**Vendor**: {nmap_report.get('vendor', 'Unknown')}")
+                st.write(f"**DNS Name**: {nmap_report.get('dns', 'Unknown')}")
+                st.write(f"**Model**: {nmap_report.get('model', 'Unknown')}")
+                st.write(f"**Firmware**: {nmap_report.get('firmware', 'Unknown')}")
+                st.write(f"**OS**: {nmap_report.get('os', 'Unknown')}")
+                st.write(f"**Open Ports**: {', '.join(map(str, nmap_report.get('open_ports', [])))}")
+                st.write("**Services**:")
+                for service in nmap_report.get('services', []):
+                    st.write(f"- {service}")
+                st.write("**Vulnerabilities**:")
+                for vuln in nmap_report.get('vulns', []):
+                    st.write(f"- {vuln}")
+                st.write(f"**Confidence Score**: {nmap_report.get('score', 0):.2%}")
+                st.write(f"**Label**: {nmap_report.get('label', 'Unknown')}")
+                st.sidebar.download_button(
+                    f"Download Nmap Report for {selected_ip}",
+                    json.dumps(nmap_report, indent=2),
+                    f"nmap_report_{selected_ip}.json",
+                    "application/json"
+                )    
 
 # ──────────────────────────────────────────────────────────────
 # Entry-point

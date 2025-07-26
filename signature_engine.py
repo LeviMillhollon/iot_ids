@@ -21,7 +21,7 @@ from scapy.packet import Raw
 from logger import log_alert  # local util to write alerts as JSONL
 
 # ---------------------------------------------------------------------------
-# ⚙️ Config
+# Config
 # ---------------------------------------------------------------------------
 
 SURICATA_SEVERITY = {
@@ -37,14 +37,14 @@ COOLDOWN_SECONDS = 60  # suppress duplicate (sig,src) alerts inside this window
 dedup_state: dict[tuple[str, str], float] = {}  # (sig_name, src_ip) -> last_ts
 
 # ---------------------------------------------------------------------------
-# ✨  Signature definitions
+# Signature definitions
 # ---------------------------------------------------------------------------
 
 # NOTE: keep *string* labels; we convert to numeric when emitting the alert.
 #       That makes it friendlier to tweak in YAML/JSON later if you externalise.
 SIGNATURES: dict[str, dict] = {
     "Cleartext Password": {
-        "patterns": [r"password=", r"pwd=", r"pass=", r"Authorization: Basic", r"login=", r"auth="],
+        "patterns": [r"password=", r"pass=", r"Authorization: Basic", r"login=", r"auth=", r"(?m)^\s*PASS\s+\S+"],
         "description": "Possible transmission of credentials in plaintext (e.g., query strings, HTTP Basic Auth).",
         "source": "OWASP IoT Top 10",
         "severity": "high",
@@ -57,7 +57,8 @@ SIGNATURES: dict[str, dict] = {
         "severity": "high",
     },
     "FTP Login": {
-        "patterns": [r"USER ", r"PASS ", r"\bFTP LOGIN\b", r"530 Login incorrect"],
+        "patterns": [r"\bFTP LOGIN\b",  r"530 Login incorrect", r"(?m)^\s*USER\s+\S+", 
+        r"(?m)^\s*PASS\s+\S+", r"(?m)^230\s+Login successful"],
         "description": "FTP sends credentials in plaintext. Often abused by malware for propagation or data exfil.",
         "severity": "medium",
     },
@@ -67,7 +68,6 @@ SIGNATURES: dict[str, dict] = {
             r"root:root",
             r"user:user",
             r"guest:guest",
-            r"1234",
             r"admin:1234",
             r"admin:password",
         ],
@@ -75,11 +75,11 @@ SIGNATURES: dict[str, dict] = {
         "severity": "medium",
     },
     "Remote Shell Execution": {
-        "patterns": [r"nc -e", r"bash -i", r"/bin/sh", r"/bin/bash", r"cmd.exe", r"powershell.exe"],
+        "patterns": [ r"/dev/tcp", r"nc -e", r"bash -i", r"/bin/sh", r"/bin/bash", r"cmd.exe", r"powershell.exe"],
         "description": "Command injection via reverse shell payloads.",
         "severity": "high",
     },
-    "Malicious Download": {
+    "Downloads": {
         "patterns": [r"wget http", r"curl http", r"tftp ", r"ftp://", r"http://.*\.bin"],
         "description": "Signatures for file downloads, often seen in botnet propagation.",
         "severity": "medium",
@@ -90,7 +90,7 @@ SIGNATURES: dict[str, dict] = {
         "severity": "medium",
     },
     "Mirai Botnet": {
-        "patterns": [r"/shell", r"/busybox", r"/bin/busybox", r"Content-Length: 109"],
+        "patterns": [ r"/busybox", r"/bin/busybox", r"Content-Length: 109"],
         "description": "Hardcoded commands and indicators from Mirai infection payloads.",
         "severity": "high",
     },
@@ -121,7 +121,7 @@ COMPILED_SIGS: dict[str, dict] = {
 }
 
 # ---------------------------------------------------------------------------
-# 🔎  Helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _context_slice(buffer: str, match: re.Match, ctx: int = 10) -> str:

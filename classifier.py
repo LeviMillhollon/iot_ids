@@ -17,6 +17,7 @@ class DeviceType(Enum):
     COMPUTER = "Computer"
     GAME_CONSOLE = "Game Console"
     SOUND = "Sound"
+    FRAMEO = "frameo"
     UNKNOWN = "Unknown"
 
 
@@ -30,7 +31,7 @@ class ClassificationResult:
 class Classifier:
     # Keyword sets for classification
     KEYWORDS: Dict[DeviceType, Set[str]] = {
-        DeviceType.CAMERA: {"hikvision", "dahua", "reolink", "wyze", "arlo", "nest", "ezviz",
+        DeviceType.CAMERA: {"hikvision", "shenzhen", "dahua", "reolink", "wyze", "arlo", "nest", "ezviz",
                             "ring", "amcrest", "uniview", "logitech", "vtech"},
         DeviceType.TV: {"samsung", "lg", "sony", "vizio", "tcl", "hisense", "panasonic",
                         "sharp", "philips", "roku", "gaoshengda", "hui"},
@@ -45,15 +46,19 @@ class Classifier:
                               "kali", "raspberry", "mbp", "apple"},
         DeviceType.GAME_CONSOLE: {"xbox", "playstation", "nintendo", "switch", "hon hai"},
         DeviceType.SOUND: {"rest"},
+        DeviceType.FRAMEO:{},
     }
 
     # Port-based heuristics
     PORT_PREFERENCES: Dict[DeviceType, List[int]] = {
-        DeviceType.CAMERA: [554],         # RTSP
-        DeviceType.TV: [8009],            # Chromecast
-        DeviceType.PRINTER: [9100],       # JetDirect
-        DeviceType.ROUTER: [53],          # DNS
-        DeviceType.CELL_PHONE: [62078],
+        DeviceType.CAMERA: [554, 8554, 1935, 37777],  # RTSP, RTSP alt, RTMP, DVR
+        DeviceType.TV: [8009, 8008, 3689, 49152],  # Chromecast, Chromecast alt, DAAP, DLNA
+        DeviceType.PRINTER: [9100, 631, 515, 9220],  # JetDirect, IPP, LPD, IPP over TLS
+        DeviceType.ROUTER: [53, 8291],  # DNS, Winbox
+        DeviceType.CELL_PHONE: [62078, 5223, 5228],  # iOS sync, APNS, GCM
+        DeviceType.FRAMEO: [37406],  # Frameo 
+        DeviceType.LISTENING_DEVICE: [4070, 55442],  # Alexa/spotify, Amazon Echo
+        DeviceType.GAME_CONSOLE: [2869, 3074, 3478],  # Xbox Live, Session Traversal Utilities for NAT (STUN) and Traversal Using Relay NAT (TURN)
     }
 
     # Confidence thresholds
