@@ -98,7 +98,7 @@ iot_ids/
 ## 📚 Resources
 
 - [Alert Corpus (Google Doc)](https://docs.google.com/document/d/1TQV793w_Rc0TXcZHvD40LS-VkZSN9w8n/edit?usp=sharing)
-- [Project Report (PDF)](link)
+- [Project Report (PDF)](https://github.com/LeviMillhollon/iot_ids/blob/main/HomeIDS_Report.pdf)
 
 
 ---
