@@ -99,7 +99,7 @@ iot_ids/
 
 - [Alert Corpus (Google Doc)](https://docs.google.com/document/d/1TQV793w_Rc0TXcZHvD40LS-VkZSN9w8n/edit?usp=sharing)
 - [Project Report (PDF)](link)
-- [Demo Video (if available)](link)
+
 
 ---
 
