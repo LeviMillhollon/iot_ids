@@ -2,8 +2,7 @@
 classifier.py
 
 Guesses what kind of device we're looking at (camera, TV, router, etc.)
-based on vendor strings, hostnames, and open ports. It’s a rough but 
-effective way to label IoT stuff during profiling.
+based on vendor strings, hostnames, and open ports. 
 
 This gets used when devices connect to the HomeIDS AP — we want to 
 know what they are so we can prioritize alerts or tune scanning behavior.
@@ -32,7 +31,7 @@ class DeviceType(Enum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# What we return after classifying a device
+# What is returned after classifying a device
 # ─────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class ClassificationResult:
@@ -73,13 +72,13 @@ class Classifier:
         DeviceType.PRINTER: [9100, 631, 515, 9220],             # IPP, JetDirect, LPD
         DeviceType.ROUTER: [53, 8291],                          # DNS, Mikrotik Winbox
         DeviceType.CELL_PHONE: [62078, 5223, 5228],             # Apple sync, push services
-        DeviceType.FRAMEO: [37406],                             # Frameo photo frame app
-        DeviceType.LISTENING_DEVICE: [4070, 55442],             # Spotify, Alexa
+        DeviceType.FRAMEO: [37406],                             # Frameo,
+        DeviceType.LISTENING_DEVICE: [4070, 55442],             # Spotify/Alexa, Amazon Echo
         DeviceType.GAME_CONSOLE: [2869, 3074, 3478],            # Xbox Live, STUN/TURN
     }
 
     # ─────────────────────────────────────────────────────────────────────────
-    # How confident we need to be to say something is High or Moderate
+    # How confident it needs to be to say something is High or Moderate
     # ─────────────────────────────────────────────────────────────────────────
     THRESHOLDS: Dict[str, float] = {
         'high': 0.85,
@@ -96,9 +95,9 @@ class Classifier:
         """
         Try to figure out what kind of device this is.
 
-        We check the vendor name, the DNS hostname, and the list of open ports.
-        If they match known keywords or port signatures, we add up points and 
-        pick the best-matching category.
+        It checks the vendor name, the DNS hostname, and the list of open ports.
+        If they match known keywords or port signatures, it adds up points and 
+        picks the best-matching category.
 
         Args:
             vendor     – brand name or MAC vendor (e.g., "Hikvision", "Apple")
