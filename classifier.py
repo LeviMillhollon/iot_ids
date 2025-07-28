@@ -1,11 +1,11 @@
 """
 classifier.py
 
-Guesses what kind of device we're looking at (camera, TV, router, etc.)
+Guesses what kind of device is being looked at (camera, TV, router, etc.)
 based on vendor strings, hostnames, and open ports. 
 
-This gets used when devices connect to the HomeIDS AP — we want to 
-know what they are so we can prioritize alerts or tune scanning behavior.
+This gets used when devices connect to the HomeIDS AP — it needa to 
+know what they are so it can prioritize alerts or tune scanning behavior.
 """
 
 from dataclasses import dataclass
@@ -14,7 +14,7 @@ from typing import List, Tuple, Dict, Set, Optional
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# List of all device types we might assign
+# List of all device types it might assign
 # ─────────────────────────────────────────────────────────────────────────────
 class DeviceType(Enum):
     CAMERA = "Camera"
@@ -27,7 +27,7 @@ class DeviceType(Enum):
     GAME_CONSOLE = "Game Console"
     SOUND = "Sound"
     FRAMEO = "frameo"
-    UNKNOWN = "Unknown"  # fallback if we can't tell
+    UNKNOWN = "Unknown"  # fallback if it can't tell
 
 
 # ─────────────────────────────────────────────────────────────────────────────
