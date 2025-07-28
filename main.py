@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-IoT IDS orchestrator
+main.py — HomeIDS Orchestrator
 
-Phase 1  • Quick scan of the home LAN and JSON export
-Phase 2  • Deep scan of devices that associate with the IDS access-point
-Phase 3  • Passive packet sniffing + Suricata alert ingestion
+Runs all three phases of the IoT IDS system:
+
+1️  Quick LAN scan to inventory home devices  
+2️  Deep Nmap scan of anything that connects to the HomeIDS AP  
+3️  Live packet sniffing with:
+     • Suricata for signatures  
+     • behavioral_detect() for anomalies
+
+This is the heart of the system — it kicks everything off and spins up
+the watchers and packet processor.
 """
 from __future__ import annotations
 
@@ -18,10 +25,11 @@ import time
 from datetime import datetime
 from typing import List, Dict
 
-from scapy.all import sniff, IP  # type: ignore
+from scapy.all import sniff, IP  
 
 from classifier import Classifier
-from detection import run_detections
+#from detection import run_detections
+from behavioral_engine import behavioral_detect
 from discovery import (
     get_local_subnet,
     scan_network,
@@ -65,7 +73,15 @@ eve_offset = 0  # incremental read pointer into eve.json
 # Helper: wait for interface to be up
 # ──────────────────────────────────────────────────────────────────────────────
 def wait_for_iface(iface: str, timeout: int = 40):
-    """Block until *iface* reports oper-state "up"."""
+    """
+    Blocks until the given network interface is active.
+
+    Specifically, this checks /sys/class/net/<iface>/operstate once per second.
+    If it reads "up", it continues. If it doesn’t come up in <timeout> seconds,
+    it throws a TimeoutError and bail.
+
+    This is used to ensure wlan1 is fully initialized before packet capture begins.
+    """
     oper_state = f"/sys/class/net/{iface}/operstate"
     start = time.time()
     while time.time() - start < timeout:
@@ -83,6 +99,18 @@ def wait_for_iface(iface: str, timeout: int = 40):
 # Phase 1 · Quick passive scan of home LAN
 # ──────────────────────────────────────────────────────────────────────────────
 def quick_scan():
+    """
+    Runs an initial one-time scan of the home LAN (Phase 1).
+
+    - Uses ARP to find devices on the local subnet
+    - Looks up each MAC address vendor
+    - Attempts reverse DNS resolution
+    - Scans for open ports on each host
+    - Classifies device type based on vendor, hostname, and ports
+    - Saves result as a list of structured profiles → devices_home.json
+
+    This gives a passive snapshot of the current network without requiring user action.
+    """
     print("[+] Running quick network discovery (home network)…")
     subnet = get_local_subnet()
     for dev in scan_network(subnet):
@@ -107,6 +135,12 @@ def quick_scan():
 # Phase 2 · Deep scan of AP-connected clients
 # ──────────────────────────────────────────────────────────────────────────────
 def _get_connected_macs(iface: str = AP_IFACE) -> set[str]:
+    """
+    Uses `iw dev <iface> station dump` to list all MACs currently connected
+    to the access point. These are clients we're responsible for monitoring.
+
+    Returns a set of lowercase MAC addresses.
+    """
     try:
         out = subprocess.check_output(
             ["iw", "dev", iface, "station", "dump"], text=True
@@ -116,6 +150,13 @@ def _get_connected_macs(iface: str = AP_IFACE) -> set[str]:
         return set()
 
 def _lookup_ap_ip(mac: str) -> str | None:
+    """
+    Searches the dnsmasq DHCP leases file for the IP address assigned
+    to the given MAC address. If found, returns it as a string.
+    Returns None if the MAC is missing or the file doesn’t exist.
+
+    Used to pair MACs from the AP interface with actual IPs for scanning.
+    """
     try:
         with open(LEASES_FILE) as fh:
             for line in fh:
@@ -128,8 +169,21 @@ def _lookup_ap_ip(mac: str) -> str | None:
 
 def deep_scan_watcher() -> None:
     """
-    Continuously watch for new stations on the AP, classify their type using
-    vendor and available data, deep-scan each, and write profiles to devices_ap.json.
+    Background thread that runs every POLL_INTERVAL seconds.
+
+    - Checks which MACs are connected to the access point (wlan1)
+    - For any MAC not already profiled:
+        - Finds its IP from dnsmasq leases
+        - Tries to get vendor, hostname, and classify device type
+        - Adds it to a pending list
+    - Writes the pending list to disk (dashboard uses this)
+    - Iterates over pending list:
+        - Runs Nmap profile scan
+        - Saves deep scan result into devices_ap.json
+        - Removes that MAC from the pending list
+
+    This is Phase 2 of the system — actively profiling devices
+    that connect to the HomeIDS AP.
     """
     print("[+] Starting deep scan watcher…")
     while True:
@@ -181,7 +235,13 @@ def deep_scan_watcher() -> None:
 # Suricata integration
 # ──────────────────────────────────────────────────────────────────────────────
 def ensure_suricata():
-    """Start Suricata (daemon) on AP_IFACE if not already running."""
+    """
+    Checks if Suricata is already running. If not, launches it as a daemon.
+
+    Suricata is used to handle all signature-based detection. It watches
+    the same interface as the behavioral engine (wlan1), and logs alerts
+    to eve.json in JSONL format.
+    """
     if subprocess.call(["pidof", "suricata"], stdout=subprocess.DEVNULL) == 0:
         return
     print("[+] Launching Suricata…")
@@ -195,7 +255,15 @@ def ensure_suricata():
     time.sleep(2)  # give it a moment
 
 def read_suricata_alerts(eve_path: str = SURICATA_EVE) -> List[dict]:
-    """Return only new Suricata alerts since last call."""
+    """
+    Reads new entries from Suricata’s eve.json file since last call.
+
+    Uses a global file offset to track our position between reads.
+    Parses each new line, filters for event_type=alert, and reformats
+    each alert into a simplified dict with useful metadata.
+
+    Returns a list of new alerts ready to be passed to log_alert().
+    """
     global eve_offset
     alerts: List[dict] = []
     try:
@@ -233,6 +301,15 @@ def read_suricata_alerts(eve_path: str = SURICATA_EVE) -> List[dict]:
     return alerts
 
 def suricata_watcher():
+    """
+    Background thread that reads Suricata alerts once per second.
+
+    - Calls read_suricata_alerts() to pull any new entries from eve.json
+    - Forwards each alert to log_alert() so it gets logged like our own
+
+    This continuously feeds signature-based alerts into the main system,
+    just like the behavioral engine does.
+    """
     while True:
         for alert in read_suricata_alerts():
             log_alert(alert)
@@ -242,10 +319,18 @@ def suricata_watcher():
 # Phase 3 · Live packet signature / behaviour detections
 # ──────────────────────────────────────────────────────────────────────────────
 def packet_callback(pkt):
+    """
+    Called by Scapy every time a packet is captured on wlan1.
+
+    - Checks that it has an IP layer
+    - Sends the packet to behavioral_detect()
+    - For any alert returned, logs it via log_alert()
+
+    This is Phase 3 of the IDS — behavioral detection engine in action.
+    """
     if IP not in pkt:
         return
-    for alert in run_detections(pkt):
-        #alert.update(src_ip=pkt[IP].src, timestamp=datetime.utcnow().isoformat())
+    for alert in behavioral_detect(pkt):
         log_alert(alert)
 
 # ──────────────────────────────────────────────────────────────────────────────
