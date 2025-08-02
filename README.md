@@ -8,9 +8,9 @@
 
 - 🔍 Dual-engine detection: Suricata (signatures) + Behavioral engine (Python)
 - 📶 Raspberry Pi broadcasts Wi-Fi AP (`HomeIDS`) on `wlan1`
-- 🧠 Real-time CVE detection, port scans, brute-force login attempts
+- 🧠 Real-time CVE detection, port scans
 - 📊 Streamlit dashboard running on `http://<pi_ip>:1337`
-- 🧱 Firewall, DHCP, and NAT setup for AP isolation
+- 🧱 DHCP, and NAT setup for AP isolation
 - ✅ Systemd auto-start and status monitoring
 - 📦 Lightweight footprint with Python and SQLite support (planned)
 
